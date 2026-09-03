@@ -1,0 +1,83 @@
+name: CD Deploy (RDS PostgreSQL)
+
+# Disparo manual — as credenciais AWS Academy são passadas como inputs porque
+# tokens de sessão expiram em ~4h e não podem ser armazenados como secrets fixos.
+#
+# Pré-requisito: o repositório k8s-infra precisa ter sido implantado antes
+# (publica vpc_id/subnet_ids no SSM que este workflow lê).
+on:
+  workflow_dispatch:
+    inputs:
+      aws_access_key_id:
+        description: 'AWS Access Key ID (AWS Academy)'
+        required: true
+        type: string
+      aws_secret_access_key:
+        description: 'AWS Secret Access Key (AWS Academy)'
+        required: true
+        type: string
+      aws_session_token:
+        description: 'AWS Session Token (AWS Academy)'
+        required: true
+        type: string
+
+concurrency:
+  group: oficina-mecanica-db-infra
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Provision RDS PostgreSQL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Mask Sensitive Credentials
+        run: |
+          echo "::add-mask::${{ inputs.aws_access_key_id }}"
+          echo "::add-mask::${{ inputs.aws_secret_access_key }}"
+          echo "::add-mask::${{ inputs.aws_session_token }}"
+          echo "::add-mask::${{ secrets.DB_PASSWORD }}"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ inputs.aws_access_key_id }}
+          aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+          aws-session-token: ${{ inputs.aws_session_token }}
+          aws-region: us-east-1
+
+      - name: Bootstrap S3 Backend
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          TF_BUCKET="oficina-mecanica-tfstate-${ACCOUNT_ID}"
+
+          if aws s3api head-bucket --bucket "$TF_BUCKET" 2>/dev/null; then
+            echo "Bucket $TF_BUCKET já existe. Reutilizando..."
+          else
+            echo "Criando bucket $TF_BUCKET..."
+            aws s3api create-bucket --bucket "$TF_BUCKET" --region us-east-1
+          fi
+
+          echo "TF_BUCKET=$TF_BUCKET" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.5.7
+          terraform_wrapper: false
+
+      # Provisiona o RDS PostgreSQL e publica rds_address/rds_endpoint no SSM
+      # Parameter Store para o repositório api consumir.
+      - name: Terraform Provisioning
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: |
+          cd infra/
+          terraform init \
+            -backend-config="bucket=$TF_BUCKET" \
+            -backend-config="key=oficina-mecanica/db-infra.tfstate" \
+            -backend-config="region=us-east-1"
+
+          terraform apply -auto-approve
