@@ -4,7 +4,7 @@ Infraestrutura do banco de dados gerenciado (Terraform) do projeto **Oficina Mec
 
 Provisiona a instância RDS PostgreSQL usada pela aplicação principal (repositório [`api`](https://github.com/FIAP-15SOAT-GabrielHelton/api)).
 
-Este repositório faz parte de um conjunto de 5 (arquitetura completa na [RFC-001](https://github.com/FIAP-15SOAT-GabrielHelton/api/blob/main/docs/fase3/RFC-001-authentication-authorization-serverless.md) do repo `api`):
+Este repositório faz parte de um conjunto de 5 (arquitetura completa na [RFC-001](https://github.com/FIAP-15SOAT-GabrielHelton/api/blob/main/docs/fase3/RFC-001-authentication-authorization-serverless.md) do repo `api`). A escolha do PostgreSQL como motor de banco e o modelo relacional (diagrama ER, relacionamentos, índices/constraints de consistência) estão formalmente justificados na [RFC-003](https://github.com/FIAP-15SOAT-GabrielHelton/api/blob/main/docs/fase3/RFC-003-escolha-do-banco-e-modelo.md), também no repo `api`:
 
 | Repositório | Responsabilidade |
 | :--- | :--- |
@@ -20,7 +20,7 @@ Este repositório faz parte de um conjunto de 5 (arquitetura completa na [RFC-00
 | :--- | :--- |
 | IaC | Terraform (`hashicorp/aws` ~> 5.0) |
 | Nuvem | AWS RDS (PostgreSQL 16), Security Group, DB Subnet Group |
-| CI/CD | GitHub Actions (`workflow_dispatch`) |
+| CI/CD | GitHub Actions (`pull_request` para validação, `workflow_dispatch` para deploy/destroy) |
 | Backend do state | S3 (bucket compartilhado com os demais repositórios, key própria) |
 
 ## Arquitetura
@@ -99,9 +99,26 @@ TF_VAR_db_password=<senha> terraform plan
 
 Secret do repositório: `DB_PASSWORD` (senha do usuário `postgres` do RDS).
 
+## CI
+
+Workflow `CI (Terraform Validate)` (`.github/workflows/ci.yml`), disparado em toda Pull Request contra `main` que toque em `infra/**` — é o status check exigido pela proteção da branch `main` antes do merge. Sem credenciais AWS disponíveis em PR (só chegam via input manual no `workflow_dispatch` de deploy), a validação cobre o que não depende de nuvem real:
+
+1. **Terraform Format Check** (`terraform fmt -check -recursive`).
+2. **Terraform Init sem backend** (`terraform init -backend=false`) — baixa os providers só para validação sintática, sem acessar o bucket S3 remoto.
+3. **Terraform Validate** (`terraform validate`) — sintaxe, tipos e referências internas.
+
+Não roda `terraform plan` — exigiria as credenciais efêmeras da sessão AWS Academy, que só existem no deploy manual.
+
 ## Deploy
 
-Workflow `CD Deploy (RDS PostgreSQL)` (`workflow_dispatch`), recebendo as credenciais temporárias da sessão do AWS Academy.
+Workflow `CD Deploy (RDS PostgreSQL)` (`.github/workflows/cd_deploy.yml`, `workflow_dispatch`), disparado manualmente com as credenciais temporárias da sessão do AWS Academy. Passos do job `deploy`:
+
+1. **Mask Sensitive Credentials** — mascara as credenciais AWS e `DB_PASSWORD` no log do Actions.
+2. **Configure AWS Credentials** — autentica a sessão via `aws-actions/configure-aws-credentials`.
+3. **Bootstrap S3 Backend** — reutiliza (ou cria, se ainda não existir) o bucket S3 compartilhado de state do Terraform entre os 4 repositórios.
+4. **Terraform Provisioning** — `terraform init` + `terraform apply -auto-approve`, provisionando o RDS PostgreSQL (lendo `vpc_id`/`subnet_ids` publicados pelo `k8s-infra` no SSM) e publicando `rds_address`/`rds_endpoint` no SSM para o `api` consumir.
+
+**Pré-requisito**: o `k8s-infra` precisa ter sido implantado antes (publica os parâmetros de rede que este workflow lê).
 
 **Ordem de deploy do projeto**: `k8s-infra` → `db-infra` (este repo) → `api` → `auth-serverless` (ou use o [`deploy-orchestrator`](https://github.com/FIAP-15SOAT-GabrielHelton/deploy-orchestrator)).
 
